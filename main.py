@@ -1,11 +1,7 @@
 import asyncio
-import glob
 import json
-import logging
 import os
-import random
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -14,13 +10,6 @@ import gradio as gr
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-)
-log = logging.getLogger("icmr-api")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -33,19 +22,14 @@ PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
-# Retry settings
-MAX_RETRIES = int(os.environ.get("ICMR_MAX_RETRIES", "5"))
-RETRY_BACKOFF = float(os.environ.get("ICMR_RETRY_BACKOFF", "1.5"))
-RETRY_JITTER = float(os.environ.get("ICMR_RETRY_JITTER", "0.5"))
+# The port the server listens on – used by uvicorn and the pinger
+PORT = int(os.environ.get("PORT", 8000))   # default to 8000 for VPS
 
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
 ]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
-
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
 
 REMOTE_INDEXES = {
     "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
@@ -64,32 +48,15 @@ def _idx_ready(kind: str) -> bool:
 
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
-    """Create a new DuckDB connection with retries for remote Parquet loading."""
     con = duckdb.connect()
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    os.environ["CURL_TIMEOUT"] = "30"
-    os.environ["CURL_CONNECTTIMEOUT"] = "10"
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
-        retries = 0
-        while retries < MAX_RETRIES:
-            try:
-                lst = ", ".join(f"'{u}'" for u in urls)
-                con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-                log.info(f"Loaded index {kind} successfully")
-                break
-            except Exception as e:
-                retries += 1
-                if retries == MAX_RETRIES:
-                    log.error(f"Failed to load index {kind} after {MAX_RETRIES} attempts: {e}")
-                    con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([])")
-                    break
-                wait = RETRY_BACKOFF ** retries + random.uniform(0, RETRY_JITTER)
-                log.warning(f"Retry {retries}/{MAX_RETRIES} for {kind} in {wait:.2f}s: {e}")
-                time.sleep(wait)
+        lst = ", ".join(f"'{u}'" for u in urls)
+        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
@@ -172,15 +139,11 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    try:
-        con = _get_conn()
-        rows = con.execute(sql).fetchall()
-        cols = [d[0] for d in con.description]
-        results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-        return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-    except Exception as e:
-        log.error(f"Search error for {field}={value} ({mode}): {e}")
-        return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": str(e)}
+    con = _get_conn()
+    rows = con.execute(sql).fetchall()
+    cols = [d[0] for d in con.description]
+    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
+    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
@@ -192,13 +155,11 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         searched = []
         if _idx_ready("phone"):
             r = _run_field_search("phoneNumber", q, "exact", limit)
-            if r.get("results"):
-                all_rows.extend(r["results"])
+            all_rows.extend(r["results"])
             searched.append("phoneNumber")
         if not all_rows and _idx_ready("aadhar"):
             r = _run_field_search("aadharNumber", q, "exact", limit)
-            if r.get("results"):
-                all_rows.extend(r["results"])
+            all_rows.extend(r["results"])
             searched.append("aadharNumber")
         all_rows = _cap_duplicates(all_rows)[:limit]
         return {
@@ -209,7 +170,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         return {"query": q, "searched_fields": [], "count": 0, "results": []}
 
 
-# ── FastAPI ─────────────────────────────────────────────────────────────────
+# ── FastAPI (for API access) ────────────────────────────────────────────────
 fastapi_app = FastAPI(title="ICMR + HITEK Search API")
 
 
@@ -222,26 +183,20 @@ class BatchRequest(BaseModel):
 def root():
     return {
         "app": "ICMR + HITEK Search API",
-        "records": "2.5B (approx)",
+        "records": 2_504_793_870,
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "https://t.me/Nischay_ydv",   # 👈 full credit here
+        "developer": "@kzr0x | channel @api_wallah",
     }
 
 
 @fastapi_app.get("/health")
 def health():
-    phone_ready = _idx_ready("phone")
-    aadhar_ready = _idx_ready("aadhar")
-    status = "ok" if (phone_ready or aadhar_ready) else "degraded"
-    return {
-        "status": status,
-        "raw_database_required": False,
-        "indexes": {"phone": phone_ready, "aadhar": aadhar_ready},
-        "index_source": INDEX_SOURCE,
-    }
+    return {"status": "ok", "raw_database_required": False,
+            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+            "index_source": INDEX_SOURCE}
 
 
 @fastapi_app.get("/search")
@@ -256,27 +211,13 @@ async def search(
     q_val = (q or mobile or "").strip()
     if not q_val:
         raise HTTPException(422, "Provide q or mobile")
-
-    if not (_idx_ready("phone") or _idx_ready("aadhar")):
-        raise HTTPException(503, "Search indexes are not loaded. Please try again later.")
-
     loop = asyncio.get_running_loop()
-    try:
-        if field:
-            data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
-        else:
-            data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    except Exception as e:
-        log.exception("Search execution error")
-        raise HTTPException(500, f"Internal search error: {str(e)}")
-
-    result = {
-        "success": bool(data.get("count", 0)),
-        "query": q_val,
-        "number": q_val,
-        "total": data.get("count", 0),
-        **data,
-    }
+    if field:
+        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
+    else:
+        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
+    result = {"success": bool(data["count"]), **data, "number": q_val,
+              "total": data["count"]}
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
@@ -287,63 +228,41 @@ async def search_parallel(req: BatchRequest):
         raise HTTPException(400, "queries must not be empty")
     if len(req.queries) > 50:
         raise HTTPException(400, "max 50 queries per batch")
-
     loop = asyncio.get_running_loop()
     tasks = [
-        loop.run_in_executor(
-            pool,
-            _run_field_search,
-            item.get("field", "phoneNumber"),
-            item.get("value", ""),
-            item.get("mode", "exact"),
-            int(item.get("limit", req.limit)),
-        )
+        loop.run_in_executor(pool, _run_field_search,
+                             item.get("field", "phoneNumber"),
+                             item.get("value", ""),
+                             item.get("mode", "exact"),
+                             int(item.get("limit", req.limit)))
         for item in req.queries
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    processed = []
-    for r in results:
-        if isinstance(r, Exception):
-            processed.append({"error": str(r)})
-        else:
-            processed.append(r)
-    return Response(
-        content=json.dumps({"searches": len(req.queries), "results": processed},
-                           indent=2, ensure_ascii=False),
-        media_type="application/json",
-    )
+    results = await asyncio.gather(*tasks)
+    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
+                                       indent=2, ensure_ascii=False),
+                    media_type="application/json")
 
 
-# ── Pinger ──────────────────────────────────────────────────────────────────
+# ── Pinger (keeps app alive) ──────────────────────────────────────────────
 async def pinger():
-    port = os.getenv("PORT", "7860")
-    url = f"http://localhost:{port}/health"
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+    """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
+    url = f"http://localhost:{PORT}/health"   # uses the global PORT variable
+    async with httpx.AsyncClient(timeout=10) as client:
         while True:
             await asyncio.sleep(120)
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200:
-                    log.info("[Pinger] Health check OK")
+                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
                 else:
-                    log.warning(f"[Pinger] Unexpected status: {resp.status_code}")
+                    print(f"[Pinger] Unexpected status: {resp.status_code}")
             except Exception as e:
-                log.warning(f"[Pinger] Error: {e}")
+                print(f"[Pinger] Error: {e}")
 
 
 @fastapi_app.on_event("startup")
 async def startup_event():
     asyncio.create_task(pinger())
-    asyncio.create_task(warmup())
-
-
-async def warmup():
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(pool, _get_conn)
-        log.info("Warmup completed - indexes loaded")
-    except Exception as e:
-        log.error(f"Warmup failed: {e}")
 
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
@@ -368,7 +287,6 @@ def search_ui(query: str, limit: int) -> str:
     try:
         data = _unified_search(q, int(limit))
     except Exception as e:
-        log.exception("UI search error")
         return f"❌ Error: {str(e)}"
 
     count = data["count"]
@@ -437,11 +355,10 @@ def build_ui():
 **Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
             """)
 
-        # 👇 Updated footer with full credit
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "👨‍💻 **Developer:** <a href='https://t.me/Nischay_ydv' target='_blank'>@Nischay_ydv</a>"
+            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
             "</div>",
             elem_classes="footer"
         )
