@@ -188,7 +188,7 @@ def root():
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",
+        "developer": "@Nischay_ydv  |  Moderator ->>> Nirnay ",
     }
 
 
@@ -352,13 +352,13 @@ def build_ui():
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+
             """)
 
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
+            "👨‍💻 **Developer:** @Nischay_ydv  |  Moderator ->>> Nirnay 
             "</div>",
             elem_classes="footer"
         )
